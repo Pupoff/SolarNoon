@@ -1,0 +1,358 @@
+#include <Adafruit_IS31FL3731.h>
+#include <Adafruit_SH110X.h>
+#include <FastLED.h>
+
+Adafruit_IS31FL3731 ledRing;
+
+// Knob pins — internal 0-based index maps to user-facing ring ID 1–5
+const int KNOB_PINS[5] = {1, 46, 3, 8, 16};
+
+enum RingBehavior {
+    SYNC_WITH_KNOB,       // follows the physical analog knob
+    SYNC_WITH_MIDI_KNOB,  // follows an incoming MIDI CC value
+    SYNC_WITH_MIDI_CUSTOM // set automatically by mapLEDtoMIDI() — do not set manually
+};
+
+RingBehavior ringBehaviors[5];
+
+// Converts user-facing ring ID (1–5) to internal 0-based array index.
+// Returns -1 on invalid input — callers must check before using.
+inline int ringIdx(int id) {
+    if (id < 1 || id > 5) return -1;
+    return id - 1;
+}
+
+// ── MIDI mapping ──────────────────────────────────────────────────────────────
+
+struct MidiControl {
+    uint8_t channel; // MIDI channel 1–16
+    uint8_t number;  // CC or note number
+    // TODO: add type field (CC / Note / etc.) once MIDI layer is implemented
+};
+
+enum LedDeviceType {
+    LED_DEVICE_RING,  // full LED ring,          id = knobID 1–5 (user-facing)
+    LED_DEVICE_IS31,  // single IS31FL3731 LED,  id = linear index 0–143
+    LED_DEVICE_GPIO   // direct GPIO LED,         id = pin number
+};
+
+struct LedDevice {
+    LedDeviceType type;
+    int id;
+};
+
+// Factory helpers — use these as the first argument of mapLEDtoMIDI()
+//   Ring(1–5)                    — a full 16-LED ring
+//   UserLed(1–2)                 — user-assignable LEDs (hides GPIO vs IS31 detail)
+//   StatusLed(LED_BLE / LED_WIFI / LED_BATTERY_x) — status indicator LEDs
+LedDevice Ring(int knobID)     { return {LED_DEVICE_RING, knobID}; }
+LedDevice StatusLed(int index) { return {LED_DEVICE_IS31, index};  }
+LedDevice UserLed(int id) {
+    if (id == 1) return {LED_DEVICE_GPIO, PIN_LED_USER1}; // pink, GPIO 13
+    if (id == 2) return {LED_DEVICE_IS31, LED_USER2};     // cyan, IS31 index 90
+    Serial.println("UserLed: id out of range (1–2)");
+    return {LED_DEVICE_GPIO, -1};
+}
+// Low-level fallback — prefer the factories above
+LedDevice GpioLed(int pin)     { return {LED_DEVICE_GPIO, pin};    }
+
+// Holds the last MIDI value (0–255) received per ring (internal 0-based index)
+// Updated by the MIDI layer; read by updateRings() when behavior is SYNC_WITH_MIDI_CUSTOM
+int ringMidiValues[5] = {0, 0, 0, 0, 0};
+MidiControl ringMidiMap[5];
+
+// Maps a LED device to a MIDI control.
+// For rings: automatically switches behavior to SYNC_WITH_MIDI_CUSTOM.
+//   → No need to call ledRingBehavior() separately; the mapping implies it.
+// IS31 and GPIO single-LED mappings are registered but currently dummy.
+void mapLEDtoMIDI(LedDevice device, MidiControl control) {
+    switch (device.type) {
+        case LED_DEVICE_RING: {
+            int i = ringIdx(device.id);
+            if (i < 0) {
+                Serial.println("mapLEDtoMIDI: ring knobID out of range (1–5)");
+                return;
+            }
+            ringMidiMap[i]    = control;
+            ringMidiValues[i] = 0;
+            ringBehaviors[i]  = SYNC_WITH_MIDI_CUSTOM;
+            break;
+        }
+        case LED_DEVICE_IS31:
+            // TODO: store and apply IS31 single-LED MIDI mapping
+            break;
+        case LED_DEVICE_GPIO:
+            // TODO: store and apply GPIO LED MIDI mapping
+            break;
+    }
+}
+
+// ── OLED display (SH1106G, SPI) ───────────────────────────────────────────────
+
+#define OLED_CS            9
+#define OLED_DC            10
+#define OLED_MOSI          11
+#define OLED_SCK           12
+#define OLED_RST           21
+#define PIN_DISPLAY_SWITCH 15  // SW5 — cycles through display screens
+
+Adafruit_SH1106G display(128, 64, &SPI, OLED_DC, OLED_RST, OLED_CS);
+
+int currentScreen = 1; // active screen (1–3)
+
+void drawScreen1() {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Hello World 1");
+    display.display();
+}
+
+void drawScreen2() {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Hello World 2");
+    display.display();
+}
+
+void drawScreen3() {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Hello World 3");
+    display.display();
+}
+
+void drawScreen(int screen) {
+    switch (screen) {
+        case 1: drawScreen1(); break;
+        case 2: drawScreen2(); break;
+        case 3: drawScreen3(); break;
+    }
+}
+
+// Polls the display switch and cycles to the next screen on each press.
+// Call this every loop() — debounce is handled internally via static state.
+void handleDisplaySwitch() {
+    static bool lastReading   = HIGH;
+    static bool lastStable    = HIGH;
+    static unsigned long lastChange = 0;
+
+    bool reading = digitalRead(PIN_DISPLAY_SWITCH);
+
+    if (reading != lastReading) {
+        lastChange  = millis();
+        lastReading = reading;
+    }
+
+    if ((millis() - lastChange) > 50) {
+        if (lastStable == HIGH && reading == LOW) { // stable falling edge → press
+            currentScreen = (currentScreen % 3) + 1;
+            drawScreen(currentScreen);
+        }
+        lastStable = reading;
+    }
+}
+
+void initDisplay() {
+    pinMode(PIN_DISPLAY_SWITCH, INPUT_PULLUP);
+    SPI.begin(OLED_SCK, -1, OLED_MOSI); // SCK, MISO (unused), MOSI
+    if (!display.begin(0, true)) {
+        Serial.println("SH1106G not found");
+        while (1);
+    }
+    display.setTextSize(1);
+    display.setTextColor(SH110X_WHITE);
+    drawScreen(currentScreen);
+}
+
+// ── RGB LEDs (WS2812B, IO47) ──────────────────────────────────────────────────
+
+// Strip layout — LEDs are wired in this order on a single data line:
+//   [0] SWITCH_A  [1] SWITCH_B  [2] SWITCH_C  [3] EFFECT  [4] MODE  [5–28] RING
+#define PIN_RGB_DATA    47
+#define NUM_RGB_LEDS    29
+#define RGB_RING_START   5
+#define RGB_RING_SIZE   24
+
+// Named indices for individual LEDs
+const int LED_SWITCH_A = 0;
+const int LED_SWITCH_B = 1;
+const int LED_SWITCH_C = 2;
+const int LED_EFFECT   = 3;
+const int LED_MODE     = 4;
+const int RGB_RING     = -1; // sentinel: setRGBled applies color to all 24 ring LEDs
+
+CRGB leds[NUM_RGB_LEDS];
+
+// led: LED_SWITCH_A/B/C, LED_EFFECT, LED_MODE, or RGB_RING for the full ring.
+// color: CRGB value — use {r, g, b} aggregate syntax, e.g. setRGBled(LED_MODE, {0, 255, 0})
+void setRGBled(int led, CRGB color) {
+    if (led == RGB_RING) {
+        for (int i = RGB_RING_START; i < RGB_RING_START + RGB_RING_SIZE; i++) {
+            leds[i] = color;
+        }
+    } else if (led >= 0 && led < RGB_RING_START) {
+        leds[led] = color;
+    } else {
+        Serial.println("setRGBled: invalid LED identifier");
+        return;
+    }
+    FastLED.show();
+}
+
+void initRGBLeds() {
+    FastLED.addLeds<WS2812B, PIN_RGB_DATA, GRB>(leds, NUM_RGB_LEDS);
+    FastLED.setBrightness(255);
+    FastLED.clear(true); // clear and push to strip
+}
+
+// ── Status LEDs ───────────────────────────────────────────────────────────────
+
+// Direct GPIO LED
+const int PIN_LED_USER1 = 13; // pink
+
+// IS31FL3731 linear indices for status LEDs — physical LED colors noted below.
+// IS31 is a monochrome driver: it controls brightness only, color is the LED itself.
+const int LED_BATTERY_1 = 85; // green — battery bar low
+const int LED_BATTERY_2 = 86; // green — battery bar mid
+const int LED_BATTERY_3 = 87; // green — battery bar high
+const int LED_BLE       = 88; // blue  — BLE connection status
+const int LED_WIFI      = 89; // green — WiFi connection status
+const int LED_USER2     = 90; // cyan  — user-defined
+
+// Sets an IS31FL3731 LED by its linear index (0–143), brightness 0–255
+//Relax the index limitation to change directly a led controlled by the driver (single LED from ring for exemple)
+void setStatusLed(int index, int brightness) {
+    if (index < 85 || index > 90) {
+        Serial.println("setStatusLed: index out of range (85-90)");
+        return;
+    }
+    ledRing.drawPixel(index % 16, index / 16, constrain(brightness, 0, 255));
+}
+
+void setUser1Led(bool on) {
+    digitalWrite(PIN_LED_USER1, on ? HIGH : LOW);
+}
+
+void initStatusLeds() {
+    pinMode(PIN_LED_USER1, OUTPUT);
+    setUser1Led(false);
+
+    setStatusLed(LED_BATTERY_1, 0);
+    setStatusLed(LED_BATTERY_2, 0);
+    setStatusLed(LED_BATTERY_3, 0);
+    setStatusLed(LED_BLE,       0);
+    setStatusLed(LED_WIFI,      0);
+    setStatusLed(LED_USER2,     0);
+}
+
+// ── LED rings ─────────────────────────────────────────────────────────────────
+
+// We use the Adafruit_IS31FL3731 matrix library but not as a display, purely as a
+// convenient LED driver. The adafruit matrix layout is 16 LEDs per row, which happens
+// to match our ring size exactly: each ring maps to one row (y = index, x = 0–15).
+// knobID: 1–5 (user-facing ring number), value: 0–255 (fill level, 255 = all 16 LEDs on)
+void setLedRing(int knobID, int value) {
+    int i = ringIdx(knobID);
+    if (i < 0) {
+        Serial.println("setLedRing: knobID out of range (1–5)");
+        return;
+    }
+    value = constrain(value, 0, 255);
+
+    int numLeds = (int)round(value / 255.0f * 16.0f);
+    for (int x = 0; x < 16; x++) {
+        ledRing.drawPixel(x, i, x < numLeds ? 255 : 0);
+    }
+}
+
+// Sets the update behavior for a ring. Prefer mapLEDtoMIDI() over setting
+// SYNC_WITH_MIDI_CUSTOM here directly — it also registers the MIDI control.
+void ledRingBehavior(int knobID, RingBehavior behavior) {
+    int i = ringIdx(knobID);
+    if (i < 0) {
+        Serial.println("ledRingBehavior: knobID out of range (1–5)");
+        return;
+    }
+    ringBehaviors[i] = behavior;
+}
+
+// Updates all rings according to their configured behavior.
+// Iterates internally with 0-based index; public functions called with knobID = i+1.
+void updateRings() {
+    for (int i = 0; i < 5; i++) {
+        switch (ringBehaviors[i]) {
+            case SYNC_WITH_KNOB:
+                syncLedRingWithKnob(i + 1);
+                break;
+            case SYNC_WITH_MIDI_KNOB:
+                // TODO: setLedRing(i + 1, midiKnobValue[i]);
+                break;
+            case SYNC_WITH_MIDI_CUSTOM:
+                setLedRing(i + 1, ringMidiValues[i]);
+                break;
+        }
+    }
+}
+
+// ── Knobs ─────────────────────────────────────────────────────────────────────
+
+void initKnobs() {
+    analogReadResolution(12); // 12-bit ADC → 0–4095
+    for (int i = 0; i < 5; i++) {
+        pinMode(KNOB_PINS[i], INPUT);
+    }
+}
+
+// Returns raw 12-bit ADC reading (0–4095) for the given knob (knobID 1–5)
+int readKnob(int knobID) {
+    int i = ringIdx(knobID);
+    if (i < 0) {
+        Serial.println("readKnob: knobID out of range (1–5)");
+        return 0;
+    }
+    return analogRead(KNOB_PINS[i]);
+}
+
+// Reads knob, maps to 0–255, and updates its LED ring accordingly
+void syncLedRingWithKnob(int knobID) {
+    int i = ringIdx(knobID);
+    if (i < 0) {
+        Serial.println("syncLedRingWithKnob: knobID out of range (1–5)");
+        return;
+    }
+    int value = map(readKnob(knobID), 0, 4095, 0, 255);
+    setLedRing(knobID, value);
+}
+
+// ── Setup / Loop ──────────────────────────────────────────────────────────────
+
+void setup() {
+    Serial.begin(115200);
+
+    if (!ledRing.begin()) {
+        Serial.println("IS31FL3731 not found");
+        while (1);
+    }
+
+    initDisplay();
+    initRGBLeds();
+    initKnobs();
+    initStatusLeds();
+
+    // Configure ring behaviors (knobID 1–5).
+    // Use ledRingBehavior() for SYNC_WITH_KNOB / SYNC_WITH_MIDI_KNOB.
+    // Use mapLEDtoMIDI()    for SYNC_WITH_MIDI_CUSTOM — it sets the behavior automatically.
+    ledRingBehavior(1, SYNC_WITH_MIDI_KNOB);
+    ledRingBehavior(2, SYNC_WITH_KNOB);
+    ledRingBehavior(3, SYNC_WITH_KNOB);
+    ledRingBehavior(4, SYNC_WITH_KNOB);
+    mapLEDtoMIDI(Ring(5),               {1, 3});  // ring 5   → ch1 CC3
+    mapLEDtoMIDI(UserLed(1), {1, 60}); // user1 → ch1 note 60 (middle C)
+    mapLEDtoMIDI(UserLed(2), {1, 62}); // user2 → ch1 note 62 (D4)
+    setRGBled(LED_MODE, {0, 255, 0})
+}
+
+void loop() {
+    updateRings();
+    handleDisplaySwitch();
+}
