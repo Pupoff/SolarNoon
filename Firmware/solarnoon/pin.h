@@ -1,12 +1,28 @@
+// midi_a14h - MIDI controller firmware
+// Copyright (C) 2026 Maxime Popoff
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 #pragma once
 
-// Battery ADC — BQ24074 OUT → divider R1=450k/R2=100k → IO6
+// Battery ADC, BQ24074 OUT → divider R1=450k/R2=100k → IO6
 #define PIN_BATT_ADC    6
 
-// BLE on/off switch — LOW = BLE OFF, HIGH = BLE ON
+// BLE on/off switch, LOW = BLE OFF, HIGH = BLE ON
 #define PIN_BLE_SW 42
 
-// Knob 3 — uncomment to use RV112FF endless pot instead of the analog pot.
+// Knob 3, uncomment to use RV112FF endless pot instead of the analog pot.
 // Track A stays on KNOB_PINS[2] (GPIO4). Track B (second wiper) on IO2.
 // If rotation direction is wrong, swap the two wiper wires on the PCB.
 #define KNOB3_IS_ENDLESS
@@ -53,5 +69,5 @@
 #define PIN_DISPLAY_SWITCH 15  // SW5: cycles through display screens
 
 
-// Knob pins — internal 0-based index maps to user-facing ring ID 1-5
+// Knob pins, internal 0-based index maps to user-facing ring ID 1-5
 const int KNOB_PINS[5] = {7,9,4,8,10};//base: {14, 46, 3, 8, 16};

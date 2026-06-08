@@ -1,7 +1,23 @@
+// midi_a14h - MIDI controller firmware
+// Copyright (C) 2026 Maxime Popoff
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 #include "midi.h"
 #include "debug.h"
 #include "leds_mono.h"         // setIS31Led(), ringBehaviors[], ringMidiValues[], ringIdx()
-#include "Archetype-Henson.h"  // Section enum → SECTION_COUNT
+#include "effectControls.h"  // Section enum → SECTION_COUNT
 #include <Control_Surface.h>
 #include <tusb.h>              // tud_mounted()
 
@@ -15,7 +31,8 @@
 #endif
 #include "three_way_switch.h" // threeWayPosition
 #include "knobs.h"            // readKnob()
-#include "switches.h"     
+#include "switches.h"
+#include "display.h"          // isInInfoMode(), triggerBleWarning(), updateBleStatusLeds()
 //#include "leds_rgb.h"         // can't be called here, control_surface already here
 
 // ── Globals ───────────────────────────────────────────────────────────────────
@@ -25,7 +42,7 @@ LedMidiEntry ledMidiEntries[MAX_LED_ENTRIES];
 int          ledMidiEntryCount = 0;
 bool         displayRefreshNeeded = false;
 
-// Boot-time BLE/USB selection via placement new — only one interface is ever
+// Boot-time BLE/USB selection via placement new, only one interface is ever
 // constructed, so Control_Surface only registers the active one.
 static bool bleMode = false;
 alignas(USBMIDI_Interface)       static uint8_t usbBuf[sizeof(USBMIDI_Interface)];
@@ -43,18 +60,18 @@ static unsigned long feedbackSentAt  = 0;
 // Echo suppression: feedback the DAW echoes back on MIDI_CHANNEL_RECEIVE always
 // lags one round-trip behind our sends. If presses come faster than that
 // round-trip, a stale echo of an OLDER send arrives after a NEWER send and
-// would overwrite the just-toggled local value with outdated data — forcing
+// would overwrite the just-toggled local value with outdated data, forcing
 // extra presses to "win the race". Any feedback for a CC we ourselves sent
 // recently is therefore treated as a pure round-trip echo (used only for
-// feedbackOk) and never applied to parameters[][]/rings.
+// feedbackOk) and never applied to effectControls[][]/rings.
 static uint8_t       lastSentCC = 0xFF;
 static unsigned long lastSentAt = 0;
 #define FEEDBACK_ECHO_MS 400
 
 // In SWITCH_MIDI_MODE_TOGGLE, what comes back on MIDI_CHANNEL_RECEIVE for the
 // CC we just pulsed is NOT an echo of our sent value (127/0 are just a trigger
-// pulse) — it's the plugin reporting its actual resulting on/off state, which
-// is exactly what we need to keep parameters[][].value (and the LED) correct.
+// pulse), it's the plugin reporting its actual resulting on/off state, which
+// is exactly what we need to keep effectControls[][].value (and the LED) correct.
 // So echo suppression must be skipped for that feedback; this flag marks it.
 static bool lastSendWasTrigger = false;
 
@@ -77,8 +94,34 @@ int getBleBondCount() {
     return -1; // bond count API differs between Bluedroid and NimBLE backends
 }
 
+// LED_WIFI / LED_BLE status indicators + the "switch diverged from boot-time
+// transport" warning popup. Driven straight off the physical PIN_BLE_SW
+// reading (not bleMode/isBleMode(), which are fixed at boot) so the popup can
+// detect a mismatch. Safe to call every loop(), only acts on edges.
+void updateBleStatusLeds() {
+    static bool lastBle = isBleMode(); // initialised to boot state on first call
+    bool bleOn = digitalRead(PIN_BLE_SW) == HIGH;
+    setIS31Led(LED_WIFI, bleOn ? 0 : 255); // LED_WIFI repurposed: lit when BLE is OFF
+    if (bleOn && isBleMode() && !isMidiMounted()) {
+        // Breathing animation while advertising but not connected, 2 s period
+        float phase = (millis() % 2000) * (2.0f * PI / 2000.0f);
+        setIS31Led(LED_BLE, (int)(5.0f + (1.0f - cosf(phase)) * 100.0f));
+    } else {
+        setIS31Led(LED_BLE, bleOn ? 255 : 0);
+    }
+    if (bleOn != lastBle) {
+        lastBle = bleOn;
+        if (isInInfoMode()) displayRefreshNeeded = true;
+        if (bleOn != isBleMode()) {
+            // Switch diverged from the boot-time transport selection
+            if (!bleOn && isBleMode()) disableBle(); // stop sending while BLE hw runs
+            triggerBleWarning(bleOn);
+        }
+    }
+}
+
 // ── BLE peer info tracking (NimBLE only) ─────────────────────────────────────
-// A secondary GAP event listener — NimBLE supports multiple, no conflict.
+// A secondary GAP event listener, NimBLE supports multiple, no conflict.
 
 #if defined(CONFIG_BT_NIMBLE_ENABLED)
 static struct ble_gap_event_listener s_bleListener;
@@ -133,7 +176,7 @@ BlePeerInfo getBlePeerInfo() {
 }
 
 // ── MIDI lookup table ─────────────────────────────────────────────────────────
-// Built once at init. Maps MIDI CC number → parameters[section][param] index.
+// Built once at init. Maps MIDI CC number → effectControls[section][param] index.
 
 struct MidiLookupEntry { uint8_t section, param; bool valid; };
 static MidiLookupEntry midiLookup[128];
@@ -142,10 +185,10 @@ void buildMidiLookup() {
     for (int n = 0; n < 128; n++) midiLookup[n].valid = false;
     for (int i = 0; i < SECTION_COUNT; i++) {
         for (int j = 0; j < MAX_PARAMS; j++) {
-            int note = parameters[i][j].midiNote;
+            int note = effectControls[i][j].midiNote;
             // skip 0 (often uninitialized) and already-claimed notes
             if (note > 0 && note < 128
-                    && parameters[i][j].label != nullptr
+                    && effectControls[i][j].label != nullptr
                     && !midiLookup[note].valid) {
                 midiLookup[note] = {(uint8_t)i, (uint8_t)j, true};
             }
@@ -213,18 +256,18 @@ static bool channelMessageCallback(ChannelMessage cm) {
     if (ch == MIDI_CHANNEL_RECEIVE && !isEchoOfOwnSend) {
         size_t si, sj;
         if (findParamByCC(cc, si, sj)) {
-            switch (parameters[si][sj].type) {
+            switch (effectControls[si][sj].type) {
                 case SWITCH:
-                    parameters[si][sj].value = (val > 63) ? 1 : 0;
+                    effectControls[si][sj].value = (val > 63) ? 1 : 0;
                     break;
                 case THREE_WAY_SWITCH:
-                    parameters[si][sj].value = (val < 43) ? 0 : (val < 86) ? 1 : 2;
+                    effectControls[si][sj].value = (val < 43) ? 0 : (val < 86) ? 1 : 2;
                     break;
                 default: // KNOB / SLIDER
-                    parameters[si][sj].value = val * 100 / 127;
+                    effectControls[si][sj].value = val * 100 / 127;
                     break;
             }
-            parameters[si][sj].known = true;
+            effectControls[si][sj].known = true;
             displayRefreshNeeded = true;
         }
 
@@ -234,7 +277,7 @@ static bool channelMessageCallback(ChannelMessage cm) {
         }
     }
 
-    // ── Update LED entry (any channel — matched by entry's stored channel) ────
+    // ── Update LED entry (any channel, matched by entry's stored channel) ────
     int idx = findLedEntryByCC(ch, cc);
     if (idx >= 0) {
         ledMidiEntries[idx].value = val;
@@ -269,14 +312,13 @@ void initMidi() {
     if (bleMode)
         ble_gap_event_listener_register(&s_bleListener, bleGapCb, nullptr);
 #endif
-    // buildMidiLookup() called from setup() AFTER initParameters()
+    // buildMidiLookup() called from setup() AFTER initEffectControls()
 }
 
 void updateMidi() {
     updateSwitchesMidi();
     updateKnobsMidi();
     updateSwitchMidi();
-    updateMode3Switch();
     Control_Surface.loop();
     // Feedback timeout: if no response within FEEDBACK_TIMEOUT_MS, mark as no feedback
     if (feedbackPending && (millis() - feedbackSentAt) > FEEDBACK_TIMEOUT_MS) {
@@ -320,7 +362,7 @@ void sendMidiCC(uint8_t ccNumber, uint8_t value) {
 
 void sendMidiSwitch(uint8_t ccNumber, uint8_t newValue) {
 #if SWITCH_MIDI_MODE == SWITCH_MIDI_MODE_TOGGLE
-    // Momentary press+release pulse — the plugin toggles its own on/off state
+    // Momentary press+release pulse, the plugin toggles its own on/off state
     // on the rising edge (127), mirroring our local `value ^= 1`. Sending the
     // release (0) too matches what a real momentary footswitch sends and is
     // what most "toggle"-mode MIDI Learn assignments expect to see.
@@ -328,8 +370,8 @@ void sendMidiSwitch(uint8_t ccNumber, uint8_t newValue) {
     sendMidiCC(ccNumber, 127);
     sendMidiCC(ccNumber, 0);
     // The feedback that follows reports the plugin's actual resulting on/off
-    // state (not an echo of our 127/0 pulse) — let it through so it can
-    // correct parameters[][].value / the effect LED if our local prediction
+    // state (not an echo of our 127/0 pulse), let it through so it can
+    // correct effectControls[][].value / the effect LED if our local prediction
     // (the XOR toggle) ever drifts from the plugin's real state.
     lastSendWasTrigger = true;
 #else

@@ -1,3 +1,19 @@
+// midi_a14h - MIDI controller firmware
+// Copyright (C) 2026 Maxime Popoff
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 #pragma once
 #include <Arduino.h>
 #include "pin.h"
@@ -15,10 +31,10 @@ struct LedDevice {
     int id;
 };
 
-// Factory helpers — use these as the first argument of mapLEDtoMIDI()
-//   RingLED(1–5)                    — a full 16-LED ring
-//   UserLed(1–2)                 — user-assignable LEDs (hides GPIO vs IS31 detail)
-//   StatusLed(LED_BLE / LED_WIFI / LED_BATTERY_x) — status indicator LEDs
+// Factory helpers, use these as the first argument of mapLEDtoMIDI()
+//   RingLED(1–5)                   , a full 16-LED ring
+//   UserLed(1–2)                , user-assignable LEDs (hides GPIO vs IS31 detail)
+//   StatusLed(LED_BLE / LED_WIFI / LED_BATTERY_x), status indicator LEDs
 inline LedDevice RingLED(int knobID)  { return {LED_DEVICE_RING, knobID}; }
 inline LedDevice StatusLed(int index) { return {LED_DEVICE_IS31, index};  }
 inline LedDevice UserLed(int id) {

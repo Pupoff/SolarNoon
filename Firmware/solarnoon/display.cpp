@@ -1,10 +1,26 @@
+// midi_a14h - MIDI controller firmware
+// Copyright (C) 2026 Maxime Popoff
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 #include "display.h"
 #include "debug.h"
 #include "pin.h"
 #include <esp_mac.h>  // esp_read_mac(), ESP_MAC_BT
 #include "effects.h"          // getPageCount, getKnobParamIdx, getSwitchParamIdx, lastKnobValues[]
 #include "parameters.h"
-#include "Archetype-Henson.h" // OTHER, OTHER_*, mode3SwitchOptions[] — mode 3 screen
+#include "effectControls.h" // OTHER, effectControls[OTHER][2] ("doubler") (mode-1 per-page LED rebind example)
 #include "midi.h"
 #include "knobs.h"            // readKnob()
 #include "three_way_switch.h" // threeWayPosition
@@ -23,7 +39,7 @@ static int  infoPage   = 1;
 static const int MODE2_COLS = 2;
 static int       mode2Page  = 0;
 
-// Highlight state — tracks last manually changed param row
+// Highlight state, tracks last manually changed param row
 static int           hlSlot   = -1;   // 0-4 = knob, 5 = switch, -1 = none
 static int           hlPage   = -1;   // page (0-based) when highlight was set
 static int           hlEffect = -1;   // effect index when highlight was set
@@ -39,7 +55,7 @@ int  getInfoPage()  { return infoPage; }
 
 // Returns a display string for a switch/three-way param value.
 static const char* switchValStr(int effect, int paramIdx, char* buf, int bufLen) {
-    const Parameter& p = parameters[effect][paramIdx];
+    const Parameter& p = effectControls[effect][paramIdx];
     if (!p.known) return "?"; // real DAW-side value not learned yet (boot, or DAW changed it)
     if (p.type == THREE_WAY_SWITCH && p.labels)
         return p.labels[p.value];
@@ -53,7 +69,7 @@ static const char* const ROM[5] = {"I", "II", "III", "IV", "V"};
 
 // Numeral column: 18px wide (fits "III"), label at x=20 (2px gap), value right-justified.
 // inverted=true: white background, black text (highlight for recently changed row).
-static void drawParamRow(int y, const char* numeral, const char* label, const char* value, bool inverted = false) {
+void drawParamRow(int y, const char* numeral, const char* label, const char* value, bool inverted) {
     if (inverted) {
         display.fillRect(0, y - 1, 128, 9, SH110X_WHITE);
         display.setTextColor(SH110X_BLACK);
@@ -78,13 +94,13 @@ static void drawPage(int page) {
     display.fillRect(0, 0, 128, 10, SH110X_WHITE);
     display.setTextColor(SH110X_BLACK);
 
-    // Effect name — left, bold (double print offset by 1px)
+    // Effect name, left, bold (double print offset by 1px)
     display.setCursor(2, 1);
     display.print(effectNames[currentEffectIdx]);
     display.setCursor(3, 1);
     display.print(effectNames[currentEffectIdx]);
 
-    // Page number — right-justified
+    // Page number, right-justified
     char pgBuf[8];
     snprintf(pgBuf, sizeof(pgBuf), "%d/%d", page + 1, pageCount);
     display.setCursor(126 - (int)strlen(pgBuf) * 6, 1);
@@ -94,25 +110,25 @@ static void drawPage(int page) {
 
     bool hlActive = (hlSlot >= 0 && millis() <= hlUntil && hlPage == page && hlEffect == effect);
 
-    // ── Knob params — Roman numeral + label + value, y = 11, 20, 29, 38, 47 ──
+    // ── Knob params, Roman numeral + label + value, y = 11, 20, 29, 38, 47 ──
     for (int slot = 0; slot < 5; slot++) {
         int paramIdx = getKnobParamIdx(effect, page, slot);
         if (paramIdx < 0) continue;
         char valStr[8];
-        if (parameters[effect][paramIdx].known)
-            snprintf(valStr, sizeof(valStr), "%d", parameters[effect][paramIdx].value);
+        if (effectControls[effect][paramIdx].known)
+            snprintf(valStr, sizeof(valStr), "%d", effectControls[effect][paramIdx].value);
         else
             strcpy(valStr, "?"); // real DAW-side value not learned yet
-        drawParamRow(11 + slot * 9, ROM[slot], parameters[effect][paramIdx].label, valStr,
+        drawParamRow(11 + slot * 9, ROM[slot], effectControls[effect][paramIdx].label, valStr,
                      hlActive && hlSlot == slot);
     }
 
-    // ── Switch param — y = 56 ────────────────────────────────────────────────
+    // ── Switch param, y = 56 ────────────────────────────────────────────────
     int swIdx = getSwitchParamIdx(effect, page);
     if (swIdx >= 0) {
         char numBuf[4];
         const char* val = switchValStr(effect, swIdx, numBuf, sizeof(numBuf));
-        drawParamRow(56, ">", parameters[effect][swIdx].label, val,
+        drawParamRow(56, ">", effectControls[effect][swIdx].label, val,
                      hlActive && hlSlot == 5);
     }
 
@@ -136,7 +152,7 @@ static void drawKnobCell(int slot, int effect, int page,
     int paramIdx = getKnobParamIdx(effect, page, slot);
     if (paramIdx < 0) return;
 
-    const char* label = parameters[effect][paramIdx].label;
+    const char* label = effectControls[effect][paramIdx].label;
     int charW    = textSize * 6;
     int charH    = textSize * 8;
     int maxChars = regionW / charW;
@@ -166,7 +182,7 @@ static void drawPageLayout2(int page) {
 
     display.clearDisplay();
 
-    // Header — same style as layout 1 (bold effect name, page right-justified)
+    // Header, same style as layout 1 (bold effect name, page right-justified)
     display.fillRect(0, 0, 128, 10, SH110X_WHITE);
     display.setTextColor(SH110X_BLACK);
     display.setCursor(2, 1); display.print(effectNames[currentEffectIdx]);
@@ -194,17 +210,17 @@ static void drawPageLayout2(int page) {
             display.setTextColor(SH110X_BLACK);
         }
 
-        // Label — truncated to column width, centred
-        const char* label = parameters[effect][paramIdx].label;
+        // Label, truncated to column width, centred
+        const char* label = effectControls[effect][paramIdx].label;
         int lLen = min((int)strlen(label), cw / 6);
         char lbuf[8]; strncpy(lbuf, label, lLen); lbuf[lLen] = '\0';
         display.setCursor(cx + max(0, (cw - lLen * 6) / 2), 16);
         display.print(lbuf);
 
-        // Value — centred
+        // Value, centred
         char vbuf[5];
-        if (parameters[effect][paramIdx].known)
-            snprintf(vbuf, sizeof(vbuf), "%d", parameters[effect][paramIdx].value);
+        if (effectControls[effect][paramIdx].known)
+            snprintf(vbuf, sizeof(vbuf), "%d", effectControls[effect][paramIdx].value);
         else
             strcpy(vbuf, "?"); // real DAW-side value not learned yet
         int vLen = strlen(vbuf);
@@ -219,7 +235,7 @@ static void drawPageLayout2(int page) {
     if (swIdx >= 0) {
         char numBuf[4];
         const char* val = switchValStr(effect, swIdx, numBuf, sizeof(numBuf));
-        drawParamRow(49, ">", parameters[effect][swIdx].label, val, hlA && hlSlot == 5);
+        drawParamRow(49, ">", effectControls[effect][swIdx].label, val, hlA && hlSlot == 5);
     }
 
     display.display();
@@ -248,12 +264,12 @@ static void drawPageLayout3(int page) {
 
     bool hlA = (hlSlot >= 0 && millis() <= hlUntil && hlPage == page && hlEffect == effect);
 
-    // Switch row — right below header
+    // Switch row, right below header
     int swIdx = getSwitchParamIdx(effect, page);
     if (swIdx >= 0) {
         char numBuf[4];
         const char* val = switchValStr(effect, swIdx, numBuf, sizeof(numBuf));
-        drawParamRow(11, ">", parameters[effect][swIdx].label, val, hlA && hlSlot == 5);
+        drawParamRow(11, ">", effectControls[effect][swIdx].label, val, hlA && hlSlot == 5);
     }
 
     // Top row (slots 0 and 4): two equal halves, y=28
@@ -333,7 +349,7 @@ static void drawScreenInfo2() {
     display.print("BRIGHTNESS");
     display.setTextColor(SH110X_WHITE);
 
-    // Brightness rows: I II IV V — evenly at y = 11, 20, 29, 38
+    // Brightness rows: I II IV V, evenly at y = 11, 20, 29, 38
     char valStr[8];
     snprintf(valStr, sizeof(valStr), "%d%%", boardSettings.ringMonoBrightness);
     drawParamRow(11, "I",  "IS31 rings",  valStr);
@@ -368,13 +384,6 @@ static void drawScreenInfo3() {
     display.display();
 }
 
-void updateInfo1Live() {
-    if (!inInfoMode || infoPage != 1) return;
-    static unsigned long lastDraw = 0;
-    unsigned long now = millis();
-    if (now - lastDraw >= 1000) { lastDraw = now; drawScreenInfo1(); }
-}
-
 // ── Info page 2: BLE ──────────────────────────────────────────────────────────
 
 static void drawScreenInfoBLE() {
@@ -393,7 +402,7 @@ static void drawScreenInfoBLE() {
     display.print(buf);
 
 
-    // Our full BT MAC — "MAC AA:BB:CC:DD:EE:FF" = 21 chars = 126px (fits)
+    // Our full BT MAC, "MAC AA:BB:CC:DD:EE:FF" = 21 chars = 126px (fits)
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_BT);
     snprintf(buf, sizeof(buf), "MAC %02X:%02X:%02X:%02X:%02X:%02X",
@@ -432,103 +441,136 @@ static void drawScreenInfoBLE() {
     display.display();
 }
 
-void updateInfoBLELive() {
-    if (!inInfoMode || infoPage != 2) return;
+// Info pages 1 (status) and 2 (BLE) both just redraw their static screen every
+// second while visible, collapse the two near-identical tickers into one,
+// switching on infoPage for which draw function to call.
+void updateInfoLiveRedraw() {
+    if (!inInfoMode || (infoPage != 1 && infoPage != 2)) return;
     static unsigned long lastDraw = 0;
     unsigned long now = millis();
-    if (now - lastDraw >= 1000) { lastDraw = now; drawScreenInfoBLE(); }
+    if (now - lastDraw < 1000) return;
+    lastDraw = now;
+    switch (infoPage) {
+        case 1: drawScreenInfo1();  break;
+        case 2: drawScreenInfoBLE(); break;
+    }
 }
 
+// State below is shared between updateInfo2Controls() (per-tick, called only
+// while info page 3 is showing) and finishInfo2Controls() (called once, by the
+// loop's info-page switch, on the tick we leave that page), hence file scope.
+static bool          info2Active       = false;
+static int           info2InitKnob[5]  = {0,0,0,0,0};
+static int           info2LastKnob[5]  = {0,0,0,0,0};
+static bool          info2TakenOver[5] = {false,false,false,false,false};
+static bool          info2Dirty        = false;
+static unsigned long info2DirtyTime    = 0;
+
 void updateInfo2Controls() {
-    static bool          active       = false;
-    static int           initKnob[5]  = {0,0,0,0,0};
-    static int           lastKnob[5]  = {0,0,0,0,0};
-    static bool          takenOver[5] = {false,false,false,false,false};
-    static bool          dirty        = false;
-    static unsigned long dirtyTime    = 0;
-
-    if (!inInfoMode || infoPage != 3) {
-        if (active && dirty) { saveSettings(); dirty = false; }
-        active = false;
-        return;
-    }
-
     static unsigned long lastRun = 0;
     unsigned long now = millis();
     if (now - lastRun < 20) return;
     lastRun = now;
 
-    if (!active) {
-        initKnob[0] = map(readKnob(1), 0, 4095, 0, 100);
-        initKnob[1] = map(readKnob(2), 0, 4095, 0, 100);
+    if (!info2Active) {
+        info2InitKnob[0] = map(readKnob(1), 0, 4095, 0, 100);
+        info2InitKnob[1] = map(readKnob(2), 0, 4095, 0, 100);
 #ifdef KNOB3_IS_ENDLESS
         setKnob3EncoderPos(boardSettings.enc3Sensitivity * 4095 / 100);
 #endif
-        initKnob[2] = map(readKnob(3), 0, 4095, 0, 100);
-        initKnob[3] = map(readKnob(4), 0, 4095, 0, 100);
-        initKnob[4] = map(readKnob(5), 0, 4095, 0, 100);
-        for (int i = 0; i < 5; i++) { lastKnob[i] = initKnob[i]; takenOver[i] = false; }
-        active = true;
+        info2InitKnob[2] = map(readKnob(3), 0, 4095, 0, 100);
+        info2InitKnob[3] = map(readKnob(4), 0, 4095, 0, 100);
+        info2InitKnob[4] = map(readKnob(5), 0, 4095, 0, 100);
+        for (int i = 0; i < 5; i++) { info2LastKnob[i] = info2InitKnob[i]; info2TakenOver[i] = false; }
+        info2Active = true;
     }
 
     bool changed = false;
 
     int k1 = map(readKnob(1), 0, 4095, 0, 100);
-    if (!takenOver[0] && abs(k1 - initKnob[0]) >= 2) takenOver[0] = true;
-    if (takenOver[0] && k1 != lastKnob[0]) { lastKnob[0] = k1; boardSettings.ringMonoBrightness = (uint8_t)k1; forceRingRedraw(); changed = true; }
+    if (!info2TakenOver[0] && abs(k1 - info2InitKnob[0]) >= 2) info2TakenOver[0] = true;
+    if (info2TakenOver[0] && k1 != info2LastKnob[0]) { info2LastKnob[0] = k1; boardSettings.ringMonoBrightness = (uint8_t)k1; forceRingRedraw(); changed = true; }
 
     int k2 = map(readKnob(2), 0, 4095, 0, 100);
-    if (!takenOver[1] && abs(k2 - initKnob[1]) >= 2) takenOver[1] = true;
-    if (takenOver[1] && k2 != lastKnob[1]) { lastKnob[1] = k2; boardSettings.rgbRingBrightness = (uint8_t)k2; changed = true; }
+    if (!info2TakenOver[1] && abs(k2 - info2InitKnob[1]) >= 2) info2TakenOver[1] = true;
+    if (info2TakenOver[1] && k2 != info2LastKnob[1]) { info2LastKnob[1] = k2; boardSettings.rgbRingBrightness = (uint8_t)k2; changed = true; }
 
     int k3 = map(readKnob(3), 0, 4095, 0, 100);
-    if (!takenOver[2] && abs(k3 - initKnob[2]) >= 2) takenOver[2] = true;
-    if (takenOver[2] && k3 != lastKnob[2]) { lastKnob[2] = k3; boardSettings.enc3Sensitivity = (uint8_t)k3; changed = true; }
+    if (!info2TakenOver[2] && abs(k3 - info2InitKnob[2]) >= 2) info2TakenOver[2] = true;
+    if (info2TakenOver[2] && k3 != info2LastKnob[2]) { info2LastKnob[2] = k3; boardSettings.enc3Sensitivity = (uint8_t)k3; changed = true; }
 
     int k4 = map(readKnob(4), 0, 4095, 0, 100);
-    if (!takenOver[3] && abs(k4 - initKnob[3]) >= 2) takenOver[3] = true;
-    if (takenOver[3] && k4 != lastKnob[3]) { lastKnob[3] = k4; boardSettings.rgbSwitchBrightness = (uint8_t)k4; changed = true; }
+    if (!info2TakenOver[3] && abs(k4 - info2InitKnob[3]) >= 2) info2TakenOver[3] = true;
+    if (info2TakenOver[3] && k4 != info2LastKnob[3]) { info2LastKnob[3] = k4; boardSettings.rgbSwitchBrightness = (uint8_t)k4; changed = true; }
 
     int k5 = map(readKnob(5), 0, 4095, 0, 100);
-    if (!takenOver[4] && abs(k5 - initKnob[4]) >= 2) takenOver[4] = true;
-    if (takenOver[4] && k5 != lastKnob[4]) {
-        lastKnob[4] = k5;
+    if (!info2TakenOver[4] && abs(k5 - info2InitKnob[4]) >= 2) info2TakenOver[4] = true;
+    if (info2TakenOver[4] && k5 != info2LastKnob[4]) {
+        info2LastKnob[4] = k5;
         boardSettings.displayContrast = (uint8_t)k5;
         display.setContrast((uint8_t)(k5 * 255 / 100));
         changed = true;
     }
 
-    if (changed) { drawScreenInfo2(); dirty = true; dirtyTime = now; }
+    if (changed) { drawScreenInfo2(); info2Dirty = true; info2DirtyTime = now; }
 
-    if (dirty && millis() - dirtyTime >= 2000) {
+    if (info2Dirty && millis() - info2DirtyTime >= 2000) {
         saveSettings();
-        dirty = false;
+        info2Dirty = false;
     }
 }
 
+void finishInfo2Controls() {
+    if (info2Active && info2Dirty) { saveSettings(); info2Dirty = false; }
+    info2Active = false; // forces a fresh knob-takeover sync on next entry
+}
+
+// Shared with finishInfo3Controls(), see info2Active comment above for why.
+static bool info3Active  = false;
+static int  info3LastPos = -1;
+
 void updateInfo3Controls() {
-    static bool active  = false;
-    static int  lastPos = -1;
-
-    if (!inInfoMode || infoPage != 4) {
-        active = false;
-        return;
-    }
-
-    if (!active) {
-        // UP decrements threeWayPosition, DOWN increments — invert to map UP→higher layout
+    if (!info3Active) {
+        // UP decrements threeWayPosition, DOWN increments, invert to map UP→higher layout
         threeWayPosition = constrain(3 - pageLayout, 0, 2);
-        lastPos = threeWayPosition;
-        active  = true;
+        info3LastPos = threeWayPosition;
+        info3Active  = true;
     }
 
-    if (threeWayPosition != lastPos) {
-        lastPos    = threeWayPosition;
+    if (threeWayPosition != info3LastPos) {
+        info3LastPos = threeWayPosition;
         pageLayout = constrain(3 - threeWayPosition, 1, 3);
         boardSettings.layoutId = (uint8_t)pageLayout;
         saveSettings();
         drawScreenInfo3();
     }
+}
+
+void finishInfo3Controls() {
+    info3Active = false; // forces threeWayPosition↔pageLayout resync on next entry
+}
+
+// Top-level info-display tick, call once per loop(). Switches on which info
+// page is showing so it's obvious at a glance which controller is live for the
+// current state, and catches the page we just LEFT to flush/reset it (each
+// controller keeps its own knob-takeover / sync state, see finishInfoX above).
+void handleInfoDisplays() {
+    static int lastInfoPage = 0; // 0 = not in info mode
+    int infoPg = isInInfoMode() ? getInfoPage() : 0;
+    if (infoPg != lastInfoPage) {
+        if (lastInfoPage == 3) finishInfo2Controls();
+        if (lastInfoPage == 4) finishInfo3Controls();
+        lastInfoPage = infoPg;
+    }
+    switch (infoPg) {
+        case 1:
+        case 2: updateInfoLiveRedraw(); break;
+        case 3: updateInfo2Controls();  break;
+        case 4: updateInfo3Controls();  break;
+    }
+
+    tickHighlight();
+    updateBleWarning();
 }
 
 // ── Display switch ─────────────────────────────────────────────────────────────
@@ -556,7 +598,7 @@ void handleDisplaySwitch() {
                 if      (infoPage == 1) { infoPage = 2; drawScreenInfoBLE(); }
                 else if (infoPage == 2) { infoPage = 3; drawScreenInfo2(); }
                 else if (infoPage == 3) { infoPage = 4; drawScreenInfo3(); }
-                else                   { inInfoMode = false; if (currentMode == 2) drawScreenMode2(); else if (currentMode == 3) drawScreenMode3(); else drawScreen(currentScreen); }
+                else                   { inInfoMode = false; drawModeScreen(currentMode); }
             } else if (currentMode == 2) {
                 const int perPage  = MODE2_COLS * 2;
                 const int numPages = (EFFECT_COUNT + perPage - 1) / perPage;
@@ -564,7 +606,7 @@ void handleDisplaySwitch() {
                     mode2Page = (mode2Page + 1) % numPages;
                     drawScreenMode2();
                 }
-            } else {
+            } else if (currentMode == 1) {
                 int effect    = effectSections[currentEffectIdx];
                 int pageCount = getPageCount(effect);
                 if (pageCount > 1) { // single-page: nothing to cycle
@@ -579,9 +621,7 @@ void handleDisplaySwitch() {
             longFired = true;
             if (inInfoMode) {
                 inInfoMode = false;
-                if      (currentMode == 2) drawScreenMode2();
-                else if (currentMode == 3) drawScreenMode3();
-                else                       drawScreen(currentScreen);
+                drawModeScreen(currentMode);
             } else {
                 inInfoMode = true; infoPage = 1; drawScreenInfo1();
             }
@@ -599,7 +639,7 @@ void notifyParamChanged(int slot) {
 }
 
 void tickHighlight() {
-    if (hlSlot >= 0 && millis() > hlUntil && !isInInfoMode() && currentMode != 2 && currentMode != 3) {
+    if (hlSlot >= 0 && millis() > hlUntil && !isInInfoMode() && currentMode == 1) {
         hlSlot = -1;
         drawScreen(currentScreen);
     }
@@ -669,68 +709,30 @@ void drawScreenMode2() {
     display.display();
 }
 
-// ── Mode 3: OTHER-section controls ────────────────────────────────────────────
-// Knob 1 → input gain, knob 5 → output gain, footswitch A / effect switch →
-// on/off, knob 3 + 3-way switch → whichever of mode3SwitchOptions[] is selected
-// (Pre FX / Post FX / Cab / Doubler — defaults to Doubler).
-
-void drawScreenMode3() {
+// Failsafe shown by drawModeScreen()'s default case (in midi_a14h.ino): a slot
+// exists in modeEnabled[] (and so can be cycled to) but has no real screen
+// yet. Makes "forgot to add a case" an obvious placeholder on the hardware
+// instead of a blank/stuck display. Not static: drawModeScreen() needs it.
+void drawScreenModeGeneric(int mode) {
     display.clearDisplay();
+    char buf[22];
 
-    // ── Knockout header ───────────────────────────────────────────────────────
     display.fillRect(0, 0, 128, 10, SH110X_WHITE);
     display.setTextColor(SH110X_BLACK);
     display.setCursor(2, 1);
-    display.print("OTHER");
-    display.setCursor(3, 1);
-    display.print("OTHER");
+    display.print("MODE");
     display.setTextColor(SH110X_WHITE);
 
-    char buf[8];
-
-    const Parameter& inGain = parameters[OTHER][OTHER_INPUT_GAIN];
-    if (inGain.known) snprintf(buf, sizeof(buf), "%d", inGain.value);
-    else              strcpy(buf, "?"); // real DAW-side value not learned yet
-    drawParamRow(11, "I", inGain.label, buf);
-
-    const Parameter& outGain = parameters[OTHER][OTHER_OUTPUT_GAIN];
-    char buf2[8];
-    if (outGain.known) snprintf(buf2, sizeof(buf2), "%d", outGain.value);
-    else               strcpy(buf2, "?"); // real DAW-side value not learned yet
-    drawParamRow(20, "V", outGain.label, buf2);
-
-    char onOffBuf[4];
-    drawParamRow(38, "A", parameters[OTHER][OTHER_ON_OFF].label,
-                 switchValStr(OTHER, OTHER_ON_OFF, onOffBuf, sizeof(onOffBuf)));
-
-    int  selParamIdx = mode3SwitchOptions[mode3SelectedParam];
-    char selBuf[4];
-    drawParamRow(56, ">", parameters[OTHER][selParamIdx].label,
-                 switchValStr(OTHER, selParamIdx, selBuf, sizeof(selBuf)));
+    snprintf(buf, sizeof(buf), "Mode %d", mode);
+    display.setCursor(0, 28);
+    display.print(buf);
+    display.setCursor(0, 40);
+    display.print("not configured");
 
     display.display();
 }
 
-void updateMode3Controls() {
-    if (currentMode != 3 || isInInfoMode()) return;
-    static int lastSel = -1;
-
-#ifdef KNOB3_IS_ENDLESS
-    readKnob(3); // drives the atan2 update as a side effect → enc3LastDial is current
-    int sel = constrain(getKnob3RawDial() * 4 / ENC3_DIAL_RANGE, 0, 3);
-#else
-    int sel = constrain(map(readKnob(3), 0, 4095, 3, 0), 0, 3);
-#endif
-
-    if (sel != lastSel) {
-        mode3SelectedParam = sel;
-        lastSel            = sel;
-        drawScreenMode3();
-    }
-}
-
 void updateMode2Controls() {
-    if (currentMode != 2 || isInInfoMode()) return;
     static int lastSel = -1;
     const int perPage  = MODE2_COLS * 2;
 
@@ -752,13 +754,12 @@ void updateMode2Controls() {
 }
 
 void initDisplay() {
-    pinMode(PIN_DISPLAY_SWITCH, INPUT_PULLUP);
     SPI.begin(OLED_SCK, -1, OLED_MOSI);
     if (!display.begin(0, true)) {
         DBG_PRINTLN("SH1106G not found");
         while (1);
     }
-    display.setRotation(2); // 180° — adjust to 0 if screen is mounted the other way
+    display.setRotation(2); // 180°, adjust to 0 if screen is mounted the other way
     display.setContrast((uint8_t)(boardSettings.displayContrast * 255 / 100));
     display.setTextSize(1);
     display.setTextColor(SH110X_WHITE);
@@ -824,10 +825,8 @@ void updateBleWarning() {
     if (!bleWarnActive) return;
     if (millis() < bleWarnUntil) return;
     bleWarnActive = false;
-    if      (currentMode == 2) drawScreenMode2();
-    else if (currentMode == 3) drawScreenMode3();
-    else if (isInInfoMode())   {} // updateInfo1Live() redraws within 1 s
-    else                       drawScreen(currentScreen);
+    if (isInInfoMode()) return; // updateInfoLiveRedraw() redraws within 1 s
+    drawModeScreen(currentMode);
 }
 
 void drawScreenBatteryDead() {

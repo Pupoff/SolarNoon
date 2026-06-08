@@ -1,3 +1,19 @@
+// midi_a14h - MIDI controller firmware
+// Copyright (C) 2026 Maxime Popoff
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 #include "knobs.h"
 #include "debug.h"
 #include "leds_mono.h"  // for ringIdx()
@@ -6,7 +22,6 @@
 #include "display.h"
 #include "midi.h"             // sendMidiCC()
 #include "settings.h"         // boardSettings.enc3Sensitivity
-#include "Archetype-Henson.h" // OTHER, OTHER_INPUT_GAIN, OTHER_OUTPUT_GAIN — mode 3
 
 #ifdef KNOB3_IS_ENDLESS
 #include <math.h>
@@ -104,6 +119,16 @@ int readKnob(int knobID) {
     return stable[i];
 }
 
+void driveKnobToCC(int knobNum, int ringIdx, uint8_t cc, int& lastSent) {
+    int value = map(readKnob(knobNum), 0, 4095, 0, 127);
+    ringMidiValues[ringIdx] = value * 255 / 127;
+    if (value != lastSent) {
+        lastSent = value;
+        sendMidiCC(cc, value);
+        displayRefreshNeeded = true;
+    }
+}
+
 void debugPrintKnobs() {
     static unsigned long last = 0;
     if (millis() - last < 200) return; // throttle to 5 Hz
@@ -128,9 +153,9 @@ void updateKnobsMidi() {
     static unsigned long lastTouched[5]     = {0, 0, 0, 0, 0};
     static bool          takenOver[5]       = {false, false, false, false, false};
     // Pickup-mode bookkeeping (no-ops in JUMP mode):
-    //   pickedUp[k]         — true once the physical knob has "grabbed" the
+    //   pickedUp[k]        , true once the physical knob has "grabbed" the
     //                         parameter (soft takeover acquired).
-    //   lastAppliedValue[k] — value we last wrote into parameters[][].value via
+    //   lastAppliedValue[k], value we last wrote into effectControls[][].value via
     //                         this knob; used to detect external (DAW feedback)
     //                         changes that should make the knob re-acquire.
     static bool          pickedUp[5]        = {false, false, false, false, false};
@@ -138,39 +163,51 @@ void updateKnobsMidi() {
     if (millis() - lastRun < 20) return;
     lastRun = millis();
 
+    // Ring behavior follows the mode automatically, no setup() wiring needed:
+    // mode 1 mirrors the live parameter value (SYNC_WITH_EFFECTCONTROLS);
+    // every other mode is driven explicitly via ringMidiValues[]
+    // (SYNC_WITH_MIDI_CUSTOM), fed by that mode's own code, e.g. the per-knob
+    // loop below for mode 2, or updateModeIO()'s case 3/4 for
+    // archetypeVSTglobalcontrols/the solar-system rings (midi_a14h.ino).
+    for (int i = 1; i <= 5; i++)
+        ledRingBehavior(i, (currentMode == 1) ? SYNC_WITH_EFFECTCONTROLS : SYNC_WITH_MIDI_CUSTOM);
+
     int  effect = effectSections[currentEffectIdx];
     int  page   = currentScreen - 1;
     bool redraw = false;
 
     for (int k = 0; k < 5; k++) {
         if (currentMode == 2) {
-            ringMidiValues[k] = 0;
-            ledRingBehavior(k + 1, SYNC_WITH_MIDI_CUSTOM);
+            ringMidiValues[k] = 0; // ring off, nothing else drives it in this mode
             takenOver[k] = false;
             continue;
         }
 
         int targetEffect, paramIdx;
-        if (currentMode == 3) {
-            // Mode 3 ("OTHER" controls): only knobs 1 and 5 drive a parameter
-            // (input/output gain). Knob 3 is the switch-selector, handled by
-            // updateMode3Controls(); knobs 2 and 4 are unused.
-            targetEffect = OTHER;
-            paramIdx     = (k == 0) ? OTHER_INPUT_GAIN : (k == 4) ? OTHER_OUTPUT_GAIN : -1;
-        } else {
+        if (currentMode == 1) {
             targetEffect = effect;
             paramIdx     = getKnobParamIdx(effect, page, k);
+        } else {
+            // Any other mode (3/4/5/...) owns the knobs itself, e.g. updateModeIO()'s
+            // case 4 sends its own fixed CCs directly, don't also drive an
+            // effectControls parameter underneath it. Don't touch ringMidiValues[]
+            // here either: that mode's own updateModeIO() case writes it every
+            // tick (mode 4 mirrors the planet position), zeroing it here would
+            // race it back to 0 right before updateRings() reads it. Placeholder
+            // modes with nothing driving the ring yet get it zeroed once from
+            // updateModeIO()'s default case instead.
+            takenOver[k] = false;
+            continue;
         }
 
         if (paramIdx < 0) {
-            ringMidiValues[k] = 0;
-            ledRingBehavior(k + 1, SYNC_WITH_MIDI_CUSTOM); // ring off
+            ringMidiValues[k] = 0; // ring off, no parameter on this slot
             takenOver[k] = false;
             continue;
         }
 
         int value  = map(readKnob(k + 1), 0, 4095, 0, 100);
-        int target = parameters[targetEffect][paramIdx].value;
+        int target = effectControls[targetEffect][paramIdx].value;
 
 #define RING_VAL(v) (max(0, (v) - 5) * 255 / 100)
 
@@ -182,7 +219,7 @@ void updateKnobsMidi() {
             lastAppliedValue[k] = target;
 #ifdef KNOB3_IS_ENDLESS
             takenOver[k] = (k == 2);
-            // The endless encoder has no physical position to mismatch — its
+            // The endless encoder has no physical position to mismatch, its
             // accumulator was just seeded to `target` above, so it's already
             // aligned. Pots, however, must re-acquire on every page/effect entry.
             pickedUp[k]  = (k == 2) ? true : (KNOB_MODE == KNOB_MODE_JUMP);
@@ -190,14 +227,10 @@ void updateKnobsMidi() {
             takenOver[k] = false;
             pickedUp[k]  = (KNOB_MODE == KNOB_MODE_JUMP);
 #endif
-            ledRingBehavior(k + 1, SYNC_WITH_KNOB);
             continue;
         }
 
-        // Ring always shows the current parameter value (handles both knob and MIDI changes).
-        ledRingBehavior(k + 1, SYNC_WITH_KNOB);
-
-        // Target moved without us (DAW feedback) — release pickup so the
+        // Target moved without us (DAW feedback), release pickup so the
         // physical knob has to re-meet the new value before driving it again.
         if (target != lastAppliedValue[k]) {
             lastAppliedValue[k] = target;
@@ -217,7 +250,7 @@ void updateKnobsMidi() {
             lastKnobValues[k] = value;
             if (!crossed) continue;
             pickedUp[k] = true;
-            // fall through and apply immediately — `value` is at/just past
+            // fall through and apply immediately, `value` is at/just past
             // `target` here, so there is no audible jump
         }
 
@@ -234,15 +267,15 @@ void updateKnobsMidi() {
         lastTouched[k]                           = millis();
         lastKnobValues[k]                        = value;
         lastAppliedValue[k]                      = value;
-        parameters[targetEffect][paramIdx].value = value;
-        parameters[targetEffect][paramIdx].known = true;
-        sendMidiCC(parameters[targetEffect][paramIdx].midiNote, value * 127 / 100);
-        if (currentMode != 3) notifyParamChanged(k); // mode 3 has its own screen, no row highlight
+        effectControls[targetEffect][paramIdx].value = value;
+        effectControls[targetEffect][paramIdx].known = true;
+        sendMidiCC(effectControls[targetEffect][paramIdx].midiNote, value * 127 / 100);
+        notifyParamChanged(k);
         redraw = true;
     }
 
-    if (redraw && !isInInfoMode()) {
-        if      (currentMode == 3) drawScreenMode3();
-        else if (currentMode != 2) drawScreen(currentScreen);
+    if (redraw && !isInInfoMode() && currentMode == 1) {
+        drawScreen(currentScreen);
+        // mode 2 redraws itself via updateMode2Controls(); mode 3 and placeholders (4/5) own their own redraws
     }
 }

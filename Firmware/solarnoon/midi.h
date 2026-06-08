@@ -1,3 +1,19 @@
+// midi_a14h - MIDI controller firmware
+// Copyright (C) 2026 Maxime Popoff
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 #pragma once
 #include "parameters.h"
 #include "LedDevice.h"
@@ -45,10 +61,26 @@ bool isBleMode();         // true when booted with BLE switch ON
 void disableBle();        // silence BLE sends mid-session (activeMidi → nullptr); reboot for USB
 int         getBleBondCount();  // number of bonded BLE devices; -1 when in USB mode
 BlePeerInfo getBlePeerInfo();   // peer address + bonded/encrypted state; addr="---" if not connected
+void updateBleStatusLeds();     // LED_WIFI/LED_BLE indicators + boot-transport-mismatch warning, call every loop()
 
 void initMidi();
 void updateMidi();      // call in loop() -- runs Control_Surface.loop()
 void buildMidiLookup(); // called by initMidi(); can be re-called after parameter changes
+
+// ── Why rings can be rebound in loop() but other LEDs can't ──────────────────
+// For StatusLed/UserLed/RGBLed, mapLEDtoMIDI() appends a new entry to the
+// fixed-size ledMidiEntries[MAX_LED_ENTRIES] array (storeLedEntry, see
+// midi.cpp), which the MIDI receive callback then scans to drive that LED.
+// There's no update or remove: call it more than once for the same LED, e.g.
+// every loop() tick, or once per page, and you just keep appending duplicate
+// entries until the array fills up and further calls are silently dropped.
+//
+// LED_DEVICE_RING is the exception: its mapping isn't stored as an entry in
+// that array at all. mapLEDtoMIDI() instead writes straight into that ring's
+// own fixed slot (ringMidiMap[i] / ringMidiValues[i] / ringBehaviors[i]),
+// overwriting whatever was there before. So calling it again just replaces
+// the previous binding in place, safe to do repeatedly, including rebinding
+// a ring to a different CC depending on which page is active.
 
 // For rings, IS31, GPIO -- no color needed
 void mapLEDtoMIDI(LedDevice device, MidiControl control);

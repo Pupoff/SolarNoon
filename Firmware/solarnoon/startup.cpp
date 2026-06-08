@@ -1,3 +1,19 @@
+// midi_a14h - MIDI controller firmware
+// Copyright (C) 2026 Maxime Popoff
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 #include "startup.h"
 #include "leds_mono.h"
 #include "leds_rgb.h"
@@ -59,11 +75,11 @@ static void animFrame(int step) {
 }
 
 void startupAnimation() {
-    // ── Sunrise fill — 2 s ───────────────────────────────────────────────────
+    // ── Sunrise fill, 2 s ───────────────────────────────────────────────────
     for (int s = 0; s <= SUNRISE_STEPS; s++) {
         animFrame(s); delay(SUNRISE_MS); 
         setIS31Led(LED_USER2, s*255/SUNRISE_STEPS);
-        setUser1LedAnalog(s*255/SUNRISE_STEPS);
+        setStatusLed(LED_USER1, s*255/SUNRISE_STEPS);
         }
     // ── Hold fully lit ────────────────────────────────────────────────────────
     delay(600);
@@ -71,7 +87,7 @@ void startupAnimation() {
     // ── All off ───────────────────────────────────────────────────────────────
     for (int r = 1; r <= 5; r++) setLedRing(r, 0);
     setRGBledRaw(RGB_RING, CRGB::Black);
-    setUser1LedAnalog(0); // stop LEDC channel that was used during animation ramp
+    setStatusLed(LED_USER1, 0); // stop LEDC channel that was used during animation ramp
     setIS31Led(LED_USER2, 0);
     showRGBLeds();
 

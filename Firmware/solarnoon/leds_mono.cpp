@@ -1,9 +1,25 @@
+// midi_a14h - MIDI controller firmware
+// Copyright (C) 2026 Maxime Popoff
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 #include "leds_mono.h"
 #include "debug.h"
 #include "knobs.h"    // for readKnob()
 #include "pin.h"
 #include "settings.h" // boardSettings
-#include "effects.h"  // effectSections, currentEffectIdx, currentMode, getKnobParamIdx, parameters
+#include "effects.h"  // effectSections, currentEffectIdx, currentMode, getKnobParamIdx, effectControls
 #include "display.h"  // currentScreen
 #include <Adafruit_IS31FL3731.h>
 #include <Wire.h>
@@ -16,7 +32,7 @@ int          ringMidiValues[5] = {0, 0, 0, 0, 0};
 static int lastRing[5] = {-1,-1,-1,-1,-1};
 
 // Adafruit begin() enables all 144 LEDs by default.
-// Unconnected LEDs cause crosstalk — must be explicitly disabled.
+// Unconnected LEDs cause crosstalk, must be explicitly disabled.
 //
 // Physical wiring:
 //   Matrix A (CS1-CS8):  all 9 rows fully connected
@@ -203,15 +219,19 @@ void updateRings() {
     lastRun = millis();
     for (int i = 0; i < 5; i++) {
         switch (ringBehaviors[i]) {
-            case SYNC_WITH_KNOB: {
+            case SYNC_WITH_EFFECTCONTROLS: {
                 // Ring reflects the parameter value for this slot,
                 // whether it was set by the physical knob or by an incoming MIDI CC.
+                // Only meaningful in mode 1 (effectControls[][] is its concept);
+                // updateKnobsMidi() only assigns this behavior there, see its
+                // auto-assignment loop, so currentMode == 1 always holds when
+                // val ends up non-zero, the check just keeps this safe standalone.
                 int val = 0;
-                if (currentMode != 2 && currentMode != 3) {
+                if (currentMode == 1) {
                     int effect   = effectSections[currentEffectIdx];
                     int paramIdx = getKnobParamIdx(effect, currentScreen - 1, i);
                     if (paramIdx >= 0)
-                        val = max(0, parameters[effect][paramIdx].value - 5) * 255 / 100;
+                        val = max(0, effectControls[effect][paramIdx].value - 5) * 255 / 100;
                 }
                 if (lastRing[i] < 0 || val != lastRing[i]) {
                     lastRing[i] = val;
@@ -247,19 +267,18 @@ void setIS31Led(int index, int brightness) {
     ledRing.drawPixel(index % 16, index / 16, constrain(brightness, 0, 255));
 }
 
+static void setUser1LedAnalog(int val) {
+    analogWrite(PIN_LED_USER1, val);
+}
+
 void setStatusLed(int index, int brightness) {
+    if (index == LED_USER1) { setUser1LedAnalog(brightness); return; }
     setIS31Led(index, brightness);
 }
 
-void setUser1Led(bool on) {
-    digitalWrite(PIN_LED_USER1, on ? HIGH : LOW);
-}
-void setUser1LedAnalog(int val) {
-    analogWrite(PIN_LED_USER1, val);
-}
 void initStatusLeds() {
     pinMode(PIN_LED_USER1, OUTPUT);
-    setUser1LedAnalog(0); // use PWM path to properly clear any LEDC channel
+    setStatusLed(LED_USER1, 0); // use PWM path to properly clear any LEDC channel
     setStatusLed(LED_BATTERY_1, 0);
     setStatusLed(LED_BATTERY_2, 0);
     setStatusLed(LED_BATTERY_3, 0);
